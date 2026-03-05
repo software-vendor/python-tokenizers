@@ -1,0 +1,137 @@
+name: Poll upstream tags
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      CHANGED: '${{ steps.changed.outputs.CHANGED }}'
+      LATEST_TAG: '${{ steps.fetch.outputs.LATEST_TAG }}'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load last tag (if any)
+        id: last
+        run: |
+          echo "LAST_TAG=$(cat .github/last_upstream_tag 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch latest tag from upstream
+        id: fetch
+        run: |
+          LATEST=$(gh api repos/huggingface/tokenizers/tags --jq '.[0].name')
+          echo "LATEST_TAG=$LATEST" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Compare and mark changed
+        id: changed
+        run: |
+          if [ "${{ steps.fetch.outputs.LATEST_TAG }}" != "${{ steps.last.outputs.LAST_TAG }}" ] && [ -n "${{ steps.fetch.outputs.LATEST_TAG }}" ]; then
+            echo "CHANGED=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "CHANGED=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Persist latest tag
+        if: steps.changed.outputs.CHANGED == 'true'
+        run: |
+          echo "${{ steps.fetch.outputs.LATEST_TAG }}" > .github/last_upstream_tag
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/last_upstream_tag
+          git commit -m "chore: update last upstream tag -> ${{ steps.fetch.outputs.LATEST_TAG }}" || true
+          git push
+
+  run:
+    needs: poll
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: needs.poll.outputs.CHANGED == 'true' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+
+      - name: Clone upstream tokenizers at tag
+        env:
+          TAG: ${{ needs.poll.outputs.LATEST_TAG }}
+        run: |
+          set -euo pipefail
+          echo "Cloning huggingface/tokenizers at tag ${TAG}"
+          git init upstream
+          git -C upstream remote add origin https://github.com/huggingface/tokenizers.git
+          git -C upstream fetch --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          git -C upstream checkout -q "tags/${TAG}"
+          git -C upstream rev-parse --short HEAD
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Vendor Cargo dependencies and create deterministic tarball
+        id: package
+        env:
+          TAG: ${{ needs.poll.outputs.LATEST_TAG }}
+        run: |
+          set -euo pipefail
+          echo "Detected upstream tag: ${TAG}"
+          VERSION="${TAG#v}"
+
+          CARGO_TOML="upstream/bindings/python/Cargo.toml"
+          if [ ! -f "${CARGO_TOML}" ]; then
+            echo "Error: missing ${CARGO_TOML}" >&2
+            exit 1
+          fi
+          CRATE_DIR=$(dirname "${CARGO_TOML}")
+
+          pushd "${CRATE_DIR}" >/dev/null
+          cargo --version
+          cargo fetch
+          cargo vendor
+          popd >/dev/null
+
+          VENDOR_DIR="${CRATE_DIR}/vendor"
+          TAR_NAME="tokenizers-${VERSION}-vendor.tar.zst"
+          TAR_PATH="${GITHUB_WORKSPACE}/${TAR_NAME}"
+
+          find "${VENDOR_DIR}" -type d -print0 | xargs -0 chmod 755
+          find "${VENDOR_DIR}" -type f -print0 | xargs -0 chmod 644
+
+          tar \
+            --format=gnu \
+            --sort=name \
+            --owner=0 --group=0 --numeric-owner \
+            --mtime='@0' \
+            --zstd \
+            -cf "${TAR_PATH}" \
+            -C "$(dirname "${VENDOR_DIR}")" vendor
+
+          echo "TAR_PATH=${TAR_PATH}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenizers-vendor
+          path: ${{ steps.package.outputs.TAR_PATH }}
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.package.outputs.VERSION }}"
+          TAR_PATH="${{ steps.package.outputs.TAR_PATH }}"
+          REL_TAG="vendor-${VERSION}"
+          if gh release view "$REL_TAG" >/dev/null 2>&1; then
+            gh release upload "$REL_TAG" "$TAR_PATH" --clobber
+          else
+            gh release create "$REL_TAG" "$TAR_PATH" \
+              --title "tokenizers ${VERSION} vendor" \
+              --notes "Vendored Cargo dependencies for huggingface/tokenizers ${VERSION}."
+          fi
